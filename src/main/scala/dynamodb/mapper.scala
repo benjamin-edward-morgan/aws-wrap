@@ -1056,7 +1056,7 @@ trait AmazonDynamoDBScalaMapper {
       (implicit serializer: DynamoDBSerializer[T],
                 ev: K => AttributeValue)
       : QueryMagnet[T] =
-      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, true, None)
+      queryOnSecondaryIndex(tuple._1, serializer.hashAttributeName, tuple._2, tuple._3, tuple._4, true, None)
 
     /**
       * Query a secondary index by a hash value and range condition,
@@ -1103,7 +1103,7 @@ trait AmazonDynamoDBScalaMapper {
       (implicit serializer: DynamoDBSerializer[T],
                 ev: K => AttributeValue)
       : QueryMagnet[T] =
-      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, None)
+      queryOnSecondaryIndex(tuple._1, serializer.hashAttributeName, tuple._2, tuple._3, tuple._4, tuple._5, None)
 
     /**
       * Query a secondary index by a hash value and range condition,
@@ -1150,7 +1150,7 @@ trait AmazonDynamoDBScalaMapper {
       (implicit serializer: DynamoDBSerializer[T],
                 ev: K => AttributeValue)
       : QueryMagnet[T] =
-      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, true, Some(tuple._5))
+      queryOnSecondaryIndex(tuple._1, serializer.hashAttributeName, tuple._2, tuple._3, tuple._4, true, Some(tuple._5))
 
     /**
       * Query a secondary index by a hash value and range condition,
@@ -1200,11 +1200,69 @@ trait AmazonDynamoDBScalaMapper {
       (implicit serializer: DynamoDBSerializer[T],
                 ev: K => AttributeValue)
       : QueryMagnet[T] =
-      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, Some(tuple._6))
+      queryOnSecondaryIndex(tuple._1, serializer.hashAttributeName, tuple._2, tuple._3, tuple._4, tuple._5, Some(tuple._6))
+
+
+    implicit def queryOnSecondaryIndex5
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashKeyName        */  String,
+      /* hashValue          */  K,
+      /* rangeAttributeName */  String,
+      /* rangeCondition     */  Condition
+      ))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, true, None)
+
+    implicit def queryOnSecondaryIndex6
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashKeyName        */  String,
+      /* hashValue          */  K,
+      /* rangeAttributeName */  String,
+      /* rangeCondition     */  Condition,
+      /* scanIndexForward   */  Boolean
+      ))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, tuple._6, None)
+
+    implicit def queryOnSecondaryIndex7
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashKeyName        */  String,
+      /* hashValue          */  K,
+      /* rangeAttributeName */  String,
+      /* rangeCondition     */  Condition,
+      /* totalLimit         */  Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, true, Some(tuple._6))
+
+
+    implicit def queryOnSecondaryIndex8
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashKeyName        */  String,
+      /* hashValue          */  K,
+      /* rangeAttributeName */  String,
+      /* rangeCondition     */  Condition,
+      /* scanIndexForward   */  Boolean,
+      /* totalLimit         */  Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, tuple._6, Some(tuple._7))
+
 
     private def queryOnSecondaryIndex
         [T, K]
         (indexName:           String,
+         hashAttributeName:   String,
          hashValue:           K,
          rangeAttributeName:  String,
          rangeCondition:      Condition,
@@ -1218,8 +1276,45 @@ trait AmazonDynamoDBScalaMapper {
           .withIndexName(indexName)
           .withKeyConditions(
             Map(
-              serializer.hashAttributeName -> QueryCondition.equalTo(hashValue),
-              rangeAttributeName           -> rangeCondition
+              hashAttributeName  -> QueryCondition.equalTo(hashValue),
+              rangeAttributeName -> rangeCondition
+            ).asJava
+          )
+          .withSelect(Select.ALL_ATTRIBUTES)
+          .withScanIndexForward(scanIndexForward),
+        totalLimit
+      )
+
+
+    implicit def queryOnSecondaryIndex9
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashKeyName        */  String,
+      /* hashValue          */  K,
+      /* scanIndexForward   */  Boolean,
+      /* totalLimit         */  Option[Int]))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryOnSecondaryIndex2(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5)
+
+
+    private def queryOnSecondaryIndex2
+    [T, K]
+    (indexName:           String,
+     hashAttributeName:   String,
+     hashValue:           K,
+     scanIndexForward:    Boolean     = true,
+     totalLimit:          Option[Int] = None)
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
+      queryRaw(
+        new QueryRequest()
+          .withIndexName(indexName)
+          .withKeyConditions(
+            Map(
+              hashAttributeName  -> QueryCondition.equalTo(hashValue)
             ).asJava
           )
           .withSelect(Select.ALL_ATTRIBUTES)
