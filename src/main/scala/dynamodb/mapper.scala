@@ -31,6 +31,13 @@ import com.amazonaws.services.dynamodbv2.model._
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+
+trait SecondaryIndex {
+  def indexName: String
+  def hashKeyAttributeName: String
+  def rangeKeyAttributeName: Option[String]
+}
+
 /**
   * A trait for serializers that convert Scala objects
   * to and from DynamoDB items.
@@ -58,6 +65,15 @@ trait DynamoDBSerializer[T] {
     * a range key.
     */
   def rangeAttributeName: Option[String] = None
+
+
+  case class LocalSecondaryIndex(indexName: String, rangeKeyAttribute: String) extends SecondaryIndex {
+    override def hashKeyAttributeName = hashAttributeName
+    override def rangeKeyAttributeName = Option(rangeKeyAttribute)
+  }
+
+  case class GlobalSecondaryIndex(indexName: String, hashKeyAttributeName: String, rangeKeyAttributeName: Option[String]) extends SecondaryIndex
+
 
   /**
     * Converts a DynamoDB item into a Scala object.
@@ -694,6 +710,53 @@ trait AmazonDynamoDBScalaMapper {
     local()
   }
 
+  private def queryRaw
+  [T]
+  (queryRequest: QueryRequest, totalLimit: Option[Int] = None)
+  (implicit serializer: DynamoDBSerializer[T])
+  : QueryMagnet[T] = new QueryMagnet[T] {
+    def apply() = {
+      // note this mutates the query request
+      queryRequest
+        .withTableName(tableName)
+        .withConsistentRead(config.consistentReads)
+      if (logger.isDebugEnabled)
+        queryRequest.setReturnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
+
+      val builder = Seq.newBuilder[T]
+
+      def local(lastKey: Option[DynamoDBKey] = None, numberLeftToFetch: Option[Int] = None): Future[Unit] =
+        client.query(
+          queryRequest.withExclusiveStartKey(lastKey.orNull)
+        ) flatMap { result =>
+          if (logger.isDebugEnabled)
+            logger.debug(s"query() ConsumedCapacity = ${result.getConsumedCapacity}")
+
+          val queryResult = result.getItems.asScala map { item =>
+            serializer.fromAttributeMap(item.asScala)
+          }
+
+          builder ++= (numberLeftToFetch match {
+            case Some(n) if n <= queryResult.size => queryResult.take(n)
+            case _ => queryResult
+          })
+
+          val optKey = Option {
+            result.getLastEvaluatedKey
+          }
+
+          if (optKey.isEmpty) Future.successful(())
+          else numberLeftToFetch match {
+            case Some(n) if n <= queryResult.size => Future.successful(())
+            case Some(n) => local(optKey, Some(n - queryResult.size))
+            case None => local(optKey, None)
+          }
+        }
+
+      local(None, totalLimit) map { _ => builder.result() }
+    }
+  }
+
 
 
   /**
@@ -712,514 +775,471 @@ trait AmazonDynamoDBScalaMapper {
   object QueryMagnet {
 
     /**
-      * Query a table.
-      *
-      * This is the most primitive overload, which takess a raw
-      * query request object.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * @param queryRequest
-      *     the query request object.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      * @see [[http://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/services/dynamodbv2/model/QueryRequest.html QueryRequest]]
-      */
+     * Query a table.
+     *
+     * This is the most primitive overload, which takess a raw
+     * query request object.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * @param queryRequest
+      * the query request object.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     * @see [[http://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/services/dynamodbv2/model/QueryRequest.html QueryRequest]]
+     */
     implicit def queryRequest1
-        [T]
-        (queryRequest: QueryRequest)
-        (implicit serializer: DynamoDBSerializer[T])
-        : QueryMagnet[T] =
+    [T]
+    (queryRequest: QueryRequest)
+    (implicit serializer: DynamoDBSerializer[T])
+    : QueryMagnet[T] =
       queryRaw(queryRequest)
 
     /**
-      * Query a table, with a limit.
-      *
-      * This is the most primitive overload, which takess a raw
-      * query request object.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * @param queryRequest
-      *     the query request object.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      * @see [[http://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/services/dynamodbv2/model/QueryRequest.html QueryRequest]]
-      */
+     * Query a table, with a limit.
+     *
+     * This is the most primitive overload, which takess a raw
+     * query request object.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * @param queryRequest
+      * the query request object.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     * @see [[http://docs.aws.amazon.com/AWSJavaSDK/latest/javadoc/com/amazonaws/services/dynamodbv2/model/QueryRequest.html QueryRequest]]
+     */
     implicit def queryRequest2
-        [T]
-        (tuple: /* queryRequest */ (QueryRequest,
-               /* totalLimit    */  Int))
-        (implicit serializer: DynamoDBSerializer[T])
-        : QueryMagnet[T] =
+    [T]
+    (tuple: /* queryRequest */ (QueryRequest,
+      /* totalLimit    */ Int))
+    (implicit serializer: DynamoDBSerializer[T])
+    : QueryMagnet[T] =
       queryRaw(tuple._1, Some(tuple._2))
 
-    private def queryRaw
-        [T]
-        (queryRequest: QueryRequest, totalLimit: Option[Int] = None)
-        (implicit serializer: DynamoDBSerializer[T])
-        : QueryMagnet[T] = new QueryMagnet[T] { def apply() = {
-      // note this mutates the query request
-      queryRequest
-        .withTableName(tableName)
-        .withConsistentRead(config.consistentReads)
-      if (logger.isDebugEnabled)
-        queryRequest.setReturnConsumedCapacity(ReturnConsumedCapacity.TOTAL)
 
-      val builder = Seq.newBuilder[T]
-
-      def local(lastKey: Option[DynamoDBKey] = None, numberLeftToFetch: Option[Int] = None): Future[Unit] =
-        client.query(
-          queryRequest.withExclusiveStartKey(lastKey.orNull)
-        ) flatMap { result =>
-          if (logger.isDebugEnabled)
-            logger.debug(s"query() ConsumedCapacity = ${result.getConsumedCapacity}")
-
-          val queryResult = result.getItems.asScala map { item =>
-              serializer.fromAttributeMap(item.asScala)
-          }
-
-          builder ++= (numberLeftToFetch match {
-            case Some(n) if n <= queryResult.size => queryResult.take(n)
-            case _                                => queryResult
-          })
-
-          val optKey = Option { result.getLastEvaluatedKey }
-
-          if (optKey.isEmpty) Future.successful(())
-          else numberLeftToFetch match {
-            case Some(n) if n <= queryResult.size => Future.successful(())
-            case Some(n)                          => local(optKey, Some(n - queryResult.size))
-            case None                             => local(optKey, None)
-          }
-        }
-
-      local(None, totalLimit) map { _ => builder.result() }
-    }}
 
 
     /**
-      * Query a table by a hash key value.
-      *
-      * The result will be all items with the same hash key
-      * value, but varying range keys.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash key value.
+     *
+     * The result will be all items with the same hash key
+     * value, but varying range keys.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHash1
-        [T, K]
-        (hashValue: K)
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (hashValue: K)
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHash(hashValue)
 
     /**
-      * Query a table by a hash key value, with a limit.
-      *
-      * The result will be all items with the same hash key
-      * value, but varying range keys.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash key value, with a limit.
+     *
+     * The result will be all items with the same hash key
+     * value, but varying range keys.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHash2
-        [T, K]
-        (tuple: /* hashValue  */ (K,
-                /* totalLimit */  Int))
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* hashValue  */ (K,
+      /* totalLimit */ Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHash(tuple._1, Some(tuple._2))
 
     private def queryOnHash
-        [T, K]
-        (hashValue: K, totalLimit: Option[Int] = None)
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (hashValue: K, totalLimit: Option[Int] = None)
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryRaw(mkHashKeyQuery(hashValue), totalLimit)
 
 
-
     /**
-      * Query a table by a hash value and range condition.
-      *
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash value and range condition.
+     *
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHashAndRange1
-        [T, K]
-        (tuple: /* hashValue        */ (K,
-                /* rangeCondition   */  Condition))
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* hashValue        */ (K,
+      /* rangeCondition   */ Condition))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHashAndRange(tuple._1, tuple._2, true, None)
 
     /**
-      * Query a table by a hash value and range condition,
-      * ascending or desending.
-      *
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param scanIndexForward
-      *     true for forwards scan, and false for reverse scan.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash value and range condition,
+     * ascending or desending.
+     *
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param scanIndexForward
+      * true for forwards scan, and false for reverse scan.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHashAndRange2
-        [T, K]
-        (tuple: /* hashValue        */ (K,
-                /* rangeCondition   */  Condition,
-                /* scanIndexForward */  Boolean))
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* hashValue        */ (K,
+      /* rangeCondition   */ Condition,
+      /* scanIndexForward */ Boolean))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHashAndRange(tuple._1, tuple._2, tuple._3, None)
 
     /**
-      * Query a table by a hash value and range condition,
-      * with a limit.
-      *
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash value and range condition,
+     * with a limit.
+     *
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHashAndRange3
-        [T, K]
-        (tuple: /* hashValue        */ (K,
-                /* rangeCondition   */  Condition,
-                /* totalLimit       */  Int))
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* hashValue        */ (K,
+      /* rangeCondition   */ Condition,
+      /* totalLimit       */ Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHashAndRange(tuple._1, tuple._2, true, Some(tuple._3))
 
     /**
-      * Query a table by a hash value and range condition,
-      * ascending or desending, with a limit.
-      *
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param scanIndexForward
-      *     true for forwards scan, and false for reverse scan.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a table by a hash value and range condition,
+     * ascending or desending, with a limit.
+     *
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param scanIndexForward
+      * true for forwards scan, and false for reverse scan.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnHashAndRange4
-        [T, K]
-        (tuple: /* hashValue        */ (K,
-                /* rangeCondition   */  Condition,
-                /* scanIndexForward */  Boolean,
-                /* totalLimit       */  Int))
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* hashValue        */ (K,
+      /* rangeCondition   */ Condition,
+      /* scanIndexForward */ Boolean,
+      /* totalLimit       */ Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnHashAndRange(tuple._1, tuple._2, tuple._3, Some(tuple._4))
 
     private def queryOnHashAndRange
-        [T, K]
-        (hashValue:         K,
-         rangeCondition:    Condition,
-         scanIndexForward:  Boolean,
-         totalLimit:        Option[Int])
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (hashValue: K,
+     rangeCondition: Condition,
+     scanIndexForward: Boolean,
+     totalLimit: Option[Int])
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryRaw(mkHashAndRangeKeyQuery(hashValue, rangeCondition).withScanIndexForward(scanIndexForward), totalLimit)
 
 
-
     /**
-      * Query a secondary index by a hash value and range condition.
-      *
-      * This query targets a named secondary index. The index
-      * being used must be named, as well well at the name of
-      * the attribute used as a range key in the index.
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * Note that all attributes will be requested, so that
-      * the serializer will get a complete item. This may incur
-      * extra read capacity, depending on what attributes
-      * are projected into the index.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param indexName
-      *     the name of the secondary index to query.
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeAttributeName
-      *     the name of the range key attribute used by the index.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a secondary index by a hash value and range condition.
+     *
+     * This query targets a named secondary index. The index
+     * being used must be named, as well well at the name of
+     * the attribute used as a range key in the index.
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * Note that all attributes will be requested, so that
+     * the serializer will get a complete item. This may incur
+     * extra read capacity, depending on what attributes
+     * are projected into the index.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param indexName
+      * the name of the secondary index to query.
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeAttributeName
+      * the name of the range key attribute used by the index.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnSecondaryIndex1
-      [T, K]
-      (tuple: /* indexName          */ (String,
-              /* hashValue          */  K,
-              /* rangeAttributeName */  String,
-              /* rangeCondition     */  Condition))
-      (implicit serializer: DynamoDBSerializer[T],
-                ev: K => AttributeValue)
-      : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashValue          */ K,
+      /* rangeAttributeName */ String,
+      /* rangeCondition     */ Condition))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, true, None)
 
     /**
-      * Query a secondary index by a hash value and range condition,
-      * ascending or desending.
-      *
-      * This query targets a named secondary index. The index
-      * being used must be named, as well well at the name of
-      * the attribute used as a range key in the index.
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until the full result of the query has been retrieved.
-      *
-      * Note that all attributes will be requested, so that
-      * the serializer will get a complete item. This may incur
-      * extra read capacity, depending on what attributes
-      * are projected into the index.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param indexName
-      *     the name of the secondary index to query.
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeAttributeName
-      *     the name of the range key attribute used by the index.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param scanIndexForward
-      *     true for forwards scan, and false for reverse scan.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a secondary index by a hash value and range condition,
+     * ascending or desending.
+     *
+     * This query targets a named secondary index. The index
+     * being used must be named, as well well at the name of
+     * the attribute used as a range key in the index.
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until the full result of the query has been retrieved.
+     *
+     * Note that all attributes will be requested, so that
+     * the serializer will get a complete item. This may incur
+     * extra read capacity, depending on what attributes
+     * are projected into the index.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param indexName
+      * the name of the secondary index to query.
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeAttributeName
+      * the name of the range key attribute used by the index.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param scanIndexForward
+      * true for forwards scan, and false for reverse scan.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnSecondaryIndex2
-      [T, K]
-      (tuple: /* indexName          */ (String,
-              /* hashValue          */  K,
-              /* rangeAttributeName */  String,
-              /* rangeCondition     */  Condition,
-              /* scanIndexForward   */  Boolean))
-      (implicit serializer: DynamoDBSerializer[T],
-                ev: K => AttributeValue)
-      : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashValue          */ K,
+      /* rangeAttributeName */ String,
+      /* rangeCondition     */ Condition,
+      /* scanIndexForward   */ Boolean))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, None)
 
     /**
-      * Query a secondary index by a hash value and range condition,
-      * with a limit.
-      *
-      * This query targets a named secondary index. The index
-      * being used must be named, as well well at the name of
-      * the attribute used as a range key in the index.
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * Note that all attributes will be requested, so that
-      * the serializer will get a complete item. This may incur
-      * extra read capacity, depending on what attributes
-      * are projected into the index.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param indexName
-      *     the name of the secondary index to query.
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeAttributeName
-      *     the name of the range key attribute used by the index.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a secondary index by a hash value and range condition,
+     * with a limit.
+     *
+     * This query targets a named secondary index. The index
+     * being used must be named, as well well at the name of
+     * the attribute used as a range key in the index.
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * Note that all attributes will be requested, so that
+     * the serializer will get a complete item. This may incur
+     * extra read capacity, depending on what attributes
+     * are projected into the index.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param indexName
+      * the name of the secondary index to query.
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeAttributeName
+      * the name of the range key attribute used by the index.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnSecondaryIndex3
-      [T, K]
-      (tuple: /* indexName          */ (String,
-              /* hashValue          */  K,
-              /* rangeAttributeName */  String,
-              /* rangeCondition     */  Condition,
-              /* totalLimit         */  Int))
-      (implicit serializer: DynamoDBSerializer[T],
-                ev: K => AttributeValue)
-      : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashValue          */ K,
+      /* rangeAttributeName */ String,
+      /* rangeCondition     */ Condition,
+      /* totalLimit         */ Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, true, Some(tuple._5))
 
     /**
-      * Query a secondary index by a hash value and range condition,
-      * ascending or desending, with a limit.
-      *
-      * This query targets a named secondary index. The index
-      * being used must be named, as well well at the name of
-      * the attribute used as a range key in the index.
-      * The result will be all items with the same hash key
-      * value, and range keys that match the range condition.
-      *
-      * This method will internally make repeated query calls
-      * until at most the given limit has been retrieved.
-      *
-      * Note that all attributes will be requested, so that
-      * the serializer will get a complete item. This may incur
-      * extra read capacity, depending on what attributes
-      * are projected into the index.
-      *
-      * @tparam K
-      *     a type that is viewable as an [[AttributeValue]].
-      * @param indexName
-      *     the name of the secondary index to query.
-      * @param hashValue
-      *     the hash key value to match.
-      * @param rangeAttributeName
-      *     the name of the range key attribute used by the index.
-      * @param rangeCondition
-      *     the condition to apply to the range key.
-      * @param scanIndexForward
-      *     true for forwards scan, and false for reverse scan.
-      * @param totalLimit
-      *     the total number of results you want.
-      * @param serializer
-      *     an implicit object serializer.
-      * @return result sequence of the query in a future.
-      * @see [[query]]
-      */
+     * Query a secondary index by a hash value and range condition,
+     * ascending or desending, with a limit.
+     *
+     * This query targets a named secondary index. The index
+     * being used must be named, as well well at the name of
+     * the attribute used as a range key in the index.
+     * The result will be all items with the same hash key
+     * value, and range keys that match the range condition.
+     *
+     * This method will internally make repeated query calls
+     * until at most the given limit has been retrieved.
+     *
+     * Note that all attributes will be requested, so that
+     * the serializer will get a complete item. This may incur
+     * extra read capacity, depending on what attributes
+     * are projected into the index.
+     *
+     * @tparam K
+      * a type that is viewable as an [[AttributeValue]].
+     * @param indexName
+      * the name of the secondary index to query.
+     * @param hashValue
+      * the hash key value to match.
+     * @param rangeAttributeName
+      * the name of the range key attribute used by the index.
+     * @param rangeCondition
+      * the condition to apply to the range key.
+     * @param scanIndexForward
+      * true for forwards scan, and false for reverse scan.
+     * @param totalLimit
+      * the total number of results you want.
+     * @param serializer
+      * an implicit object serializer.
+     * @return result sequence of the query in a future.
+     * @see [[query]]
+     */
     implicit def queryOnSecondaryIndex4
-      [T, K]
-      (tuple: /* indexName          */ (String,
-              /* hashValue          */  K,
-              /* rangeAttributeName */  String,
-              /* rangeCondition     */  Condition,
-              /* scanIndexForward   */  Boolean,
-              /* totalLimit         */  Int))
-      (implicit serializer: DynamoDBSerializer[T],
-                ev: K => AttributeValue)
-      : QueryMagnet[T] =
+    [T, K]
+    (tuple: /* indexName          */ (String,
+      /* hashValue          */ K,
+      /* rangeAttributeName */ String,
+      /* rangeCondition     */ Condition,
+      /* scanIndexForward   */ Boolean,
+      /* totalLimit         */ Int))
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryOnSecondaryIndex(tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, Some(tuple._6))
 
     private def queryOnSecondaryIndex
-        [T, K]
-        (indexName:           String,
-         hashValue:           K,
-         rangeAttributeName:  String,
-         rangeCondition:      Condition,
-         scanIndexForward:    Boolean     = true,
-         totalLimit:          Option[Int] = None)
-        (implicit serializer: DynamoDBSerializer[T],
-                  ev: K => AttributeValue)
-        : QueryMagnet[T] =
+    [T, K]
+    (indexName: String,
+     hashValue: K,
+     rangeAttributeName: String,
+     rangeCondition: Condition,
+     scanIndexForward: Boolean = true,
+     totalLimit: Option[Int] = None)
+    (implicit serializer: DynamoDBSerializer[T],
+     ev: K => AttributeValue)
+    : QueryMagnet[T] =
       queryRaw(
         new QueryRequest()
           .withIndexName(indexName)
           .withKeyConditions(
             Map(
               serializer.hashAttributeName -> QueryCondition.equalTo(hashValue),
-              rangeAttributeName           -> rangeCondition
+              rangeAttributeName -> rangeCondition
             ).asJava
           )
           .withSelect(Select.ALL_ATTRIBUTES)
@@ -1227,6 +1247,111 @@ trait AmazonDynamoDBScalaMapper {
         totalLimit
       )
   }
+
+
+
+  /**Primary Hash Key**/
+  def queryOnPrimaryHash
+  [T, K]
+  (hashValue: K,
+   scanIndexForward: Boolean = true,
+   totalLimit: Option[Int] = None)
+  (implicit serializer: DynamoDBSerializer[T],
+   ev: K => AttributeValue)
+  : Future[Seq[T]] =
+    queryRaw(
+      new QueryRequest()
+        .withTableName(serializer.tableName)
+        .withKeyConditions(
+          Map(
+            serializer.hashAttributeName -> QueryCondition.equalTo(hashValue)
+          ).asJava
+        )
+        .withSelect(Select.ALL_ATTRIBUTES)
+        .withScanIndexForward(scanIndexForward),
+      totalLimit
+    ).apply()
+
+  /**Primary Hash and Range**/
+  def queryOnPrimaryHashAndRange
+  [T, K]
+  (hashValue: K,
+   rangeCondition: Condition,
+   scanIndexForward: Boolean = true,
+   totalLimit: Option[Int] = None)
+  (implicit serializer: DynamoDBSerializer[T],
+   ev: K => AttributeValue)
+  : Future[Seq[T]] =
+    if(serializer.rangeAttributeName.isDefined)
+      queryRaw(
+        new QueryRequest()
+          .withTableName(serializer.tableName)
+          .withKeyConditions(
+            Map(
+              serializer.hashAttributeName -> QueryCondition.equalTo(hashValue),
+              serializer.rangeAttributeName.get -> rangeCondition
+            ).asJava
+          )
+          .withSelect(Select.ALL_ATTRIBUTES)
+          .withScanIndexForward(scanIndexForward),
+        totalLimit
+      ).apply()
+    else
+      throw new Exception(s"Table ${serializer.tableName} does not have a primary range key")
+
+  /**Secondary Hash**/
+  def queryOnSecondaryHash
+  [T, K]
+  (index: SecondaryIndex,
+   hashValue: K,
+   scanIndexForward: Boolean = true,
+   totalLimit: Option[Int] = None)
+  (implicit serializer: DynamoDBSerializer[T],
+   ev: K => AttributeValue)
+  : Future[Seq[T]] =
+    queryRaw(
+      new QueryRequest()
+        .withIndexName(index.indexName)
+        .withKeyConditions(
+          Map(
+            index.hashKeyAttributeName -> QueryCondition.equalTo(hashValue)
+          ).asJava
+        )
+        .withSelect(Select.ALL_ATTRIBUTES)
+        .withScanIndexForward(scanIndexForward),
+      totalLimit
+    ).apply()
+
+  /**Secondary Hash and Range**/
+  def queryOnSecondaryHashAndRange
+  [T, K]
+  (index: SecondaryIndex,
+   hashValue: K,
+   rangeCondition: Condition,
+   scanIndexForward: Boolean = true,
+   totalLimit: Option[Int] = None)
+  (implicit serializer: DynamoDBSerializer[T],
+   ev: K => AttributeValue)
+  : Future[Seq[T]] =
+    queryRaw(
+      new QueryRequest()
+        .withIndexName(index.indexName)
+        .withKeyConditions(
+          if(index.rangeKeyAttributeName.isDefined)
+            Map(
+              index.hashKeyAttributeName -> QueryCondition.equalTo(hashValue),
+              index.rangeKeyAttributeName.get -> rangeCondition
+            ).asJava
+          else
+            throw new Exception(s"Index ${index.indexName} does not have a range key")
+        )
+        .withSelect(Select.ALL_ATTRIBUTES)
+        .withScanIndexForward(scanIndexForward),
+      totalLimit
+    ).apply()
+
+
+
 
   /**
     * Query a table.
