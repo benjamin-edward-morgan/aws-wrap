@@ -3,7 +3,7 @@ import sbt._
 object Dependencies {
 
   object V {
-    val awsJavaSDK  = "1.9.31"
+    val awsJavaSDK  = "1.10.2"
 
     val jodaTime    = "2.7"
     val jodaConvert = "1.7"
